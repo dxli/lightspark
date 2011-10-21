@@ -160,10 +160,6 @@ public:
 	 * The returned object must be decRef'ed by caller.
 	 */
 	virtual ASObject* coerce(ASObject* o) const;
-
-	IFunction* getBorrowedMethod(const multiname& mn);
-	IFunction* getBorrowedSetter(const multiname& mn);
-	IFunction* getBorrowedGetter(const multiname& mn);
 };
 
 class Template_base : public ASObject
@@ -240,8 +236,6 @@ public:
 class IFunction: public ASObject
 {
 CLASSBUILDABLE(IFunction);
-private:
-	virtual ASObject* callImpl(ASObject* obj, ASObject* const* args, uint32_t num_args, bool thisOverride)=0;
 protected:
 	IFunction();
 	virtual IFunction* clone()=0;
@@ -266,7 +260,7 @@ public:
 	 * Return the ASObject the function returned.
 	 * This never returns NULL.
 	 */
-	ASObject* call(ASObject* obj, ASObject* const* args, uint32_t num_args);
+	virtual ASObject* call(ASObject* obj, ASObject* const* args, uint32_t num_args)=0;
 	IFunction* bind(_NR<ASObject> c, int level)
 	{
 		if(!isBound())
@@ -312,9 +306,8 @@ private:
 		return new Function(*this);
 	}
 	method_info* getMethodInfo() const { return NULL; }
-	ASObject* callImpl(ASObject* obj, ASObject* const* args, uint32_t num_args, bool thisOverride=false);
 public:
-	IFunction* toFunction();
+	ASObject* call(ASObject* obj, ASObject* const* args, uint32_t num_args);
 	bool isEqual(ASObject* r)
 	{
 		Function* f=dynamic_cast<Function*>(r);
@@ -340,10 +333,9 @@ private:
 		return new SyntheticFunction(*this);
 	}
 	method_info* getMethodInfo() const { return mi; }
-	ASObject* callImpl(ASObject* obj, ASObject* const* args, uint32_t num_args, bool thisOverride=false);
 public:
+	ASObject* call(ASObject* obj, ASObject* const* args, uint32_t num_args);
 	void finalize();
-	IFunction* toFunction();
 	std::vector<scope_entry> func_scope;
 	bool isEqual(ASObject* r)
 	{
@@ -370,6 +362,7 @@ class Class<IFunction>: public Class_base
 private:
 	Class<IFunction>():Class_base(QName("Function","")){}
 	ASObject* getInstance(bool construct, ASObject* const* args, const unsigned int argslen);
+	static Class<IFunction>* this_class;
 public:
 	static Class<IFunction>* getClass();
 	static Function* getFunction(Function::as_function v)

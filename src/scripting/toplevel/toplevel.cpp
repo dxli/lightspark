@@ -1243,7 +1243,8 @@ void ASString::sinit(Class_base* c)
 	c->setDeclaredMethodByQName("toUpperCase",AS3,Class<IFunction>::getFunction(toUpperCase),NORMAL_METHOD,true);
 	c->setDeclaredMethodByQName("fromCharCode",AS3,Class<IFunction>::getFunction(fromCharCode),NORMAL_METHOD,false);
 	c->setDeclaredMethodByQName("length","",Class<IFunction>::getFunction(_getLength),GETTER_METHOD,true);
-	c->prototype->setVariableByQName("toString",AS3,Class<IFunction>::getFunction(ASString::_toString),DYNAMIC_TRAIT);
+	c->setDeclaredMethodByQName("toString",AS3,Class<IFunction>::getFunction(_toString),NORMAL_METHOD,true);
+	c->prototype->setVariableByQName("toString","",Class<IFunction>::getFunction(_toString),DYNAMIC_TRAIT);
 }
 
 void ASString::buildTraits(ASObject* o)
@@ -2114,16 +2115,6 @@ void Number::serialize(ByteArray* out, std::map<tiny_string, uint32_t>& stringMa
 		out->writeByte(bigEndianPtr[i]);
 }
 
-IFunction* SyntheticFunction::toFunction()
-{
-	return this;
-}
-
-IFunction* Function::toFunction()
-{
-	return this;
-}
-
 IFunction::IFunction():closure_this(NULL),inClass(NULL),length(0)
 {
 	type=T_FUNCTION;
@@ -2137,20 +2128,12 @@ void IFunction::finalize()
 	closure_this.reset();
 }
 
-/**
- * This provides a unified interface for calling a C++/ABC code function.
- * It consumes one reference of obj and one of each arg
- */
-ASObject* IFunction::call(ASObject* obj, ASObject* const* args, uint32_t num_args)
-{
-	return callImpl(obj, args, num_args, false);
-}
-
 ASFUNCTIONBODY_GETTER_SETTER(IFunction,prototype);
 ASFUNCTIONBODY_GETTER(IFunction,length);
 
 ASFUNCTIONBODY(IFunction,apply)
 {
+	/* This function never changes the 'this' pointer of a method closure */
 	IFunction* th=static_cast<IFunction*>(obj);
 	assert_and_throw(argslen<=2);
 
@@ -2181,20 +2164,14 @@ ASFUNCTIONBODY(IFunction,apply)
 		}
 	}
 
-	bool overrideThis=true;
-	//Only allow overriding if the type of args[0] is a subclass of closure_this
-	if(!(th->closure_this.getPtr() && th->closure_this->classdef && newObj->classdef &&
-				newObj->classdef->isSubClass(th->closure_this->classdef)) || newObj->classdef==NULL)
-	{
-		overrideThis=false;
-	}
-	ASObject* ret=th->callImpl(newObj,newArgs,newArgsLen,overrideThis);
+	ASObject* ret=th->call(newObj,newArgs,newArgsLen);
 	delete[] newArgs;
 	return ret;
 }
 
 ASFUNCTIONBODY(IFunction,_call)
 {
+	/* This function never changes the 'this' pointer of a method closure */
 	IFunction* th=static_cast<IFunction*>(obj);
 	ASObject* newObj=NULL;
 	ASObject** newArgs=NULL;
@@ -2219,14 +2196,7 @@ ASFUNCTIONBODY(IFunction,_call)
 			newArgs[i]->incRef();
 		}
 	}
-	bool overrideThis=true;
-	//Only allow overriding if the type of args[0] is a subclass of closure_this
-	if(!(th->closure_this.getPtr() && th->closure_this->classdef && newObj->classdef &&
-			newObj->classdef->isSubClass(th->closure_this->classdef)) || newObj->classdef==NULL)
-	{
-		overrideThis=false;
-	}
-	ASObject* ret=th->callImpl(newObj,newArgs,newArgsLen,overrideThis);
+	ASObject* ret=th->call(newObj,newArgs,newArgsLen);
 	delete[] newArgs;
 	return ret;
 }
@@ -2273,13 +2243,17 @@ void SyntheticFunction::finalize()
  * by ABCVm::executeFunction() or through JIT.
  * It consumes one reference of obj and one of each arg
  */
-ASObject* SyntheticFunction::callImpl(ASObject* obj, ASObject* const* args, uint32_t numArgs, bool thisOverride)
+ASObject* SyntheticFunction::call(ASObject* obj, ASObject* const* args, uint32_t numArgs)
 {
 	const int hit_threshold=10;
-	if(mi->body==NULL)
+	assert_and_throw(mi->body);
+
+	if(ABCVm::cur_recursion == sys->currentVm->limits.max_recursion)
 	{
-//		LOG(LOG_NOT_IMPLEMENTED,_("Not initialized function"));
-		return NULL;
+		for(uint32_t i=0;i<numArgs;i++)
+			args[i]->decRef();
+		obj->decRef();
+		throw Class<ASError>::getInstanceS("Error #1023: Stack overflow occurred");
 	}
 
 	/* resolve argument and return types */
@@ -2341,8 +2315,8 @@ ASObject* SyntheticFunction::callImpl(ASObject* obj, ASObject* const* args, uint
 	cc->initialScopeStack=func_scope.size();
 	getVm()->curGlobalObj = ABCVm::getGlobalScope(cc);
 
-	if(isBound() && !thisOverride)
-	{
+	if(isBound())
+	{ /* closure_this can never been overriden */
 		LOG(LOG_CALLS,_("Calling with closure ") << this);
 		if(obj)
 			obj->decRef();
@@ -2390,6 +2364,7 @@ ASObject* SyntheticFunction::callImpl(ASObject* obj, ASObject* const* args, uint
 	//obtain a local reference to this function, as it may delete itself
 	this->incRef();
 
+	ABCVm::cur_recursion++; //increment current recursion depth
 	while (true)
 	{
 		try
@@ -2429,12 +2404,14 @@ ASObject* SyntheticFunction::callImpl(ASObject* obj, ASObject* const* args, uint
 			if (no_handler)
 			{
 				delete cc;
+				ABCVm::cur_recursion--; //decrement current recursion depth
 				throw excobj;
 			}
 			continue;
 		}
 		break;
 	}
+	ABCVm::cur_recursion--; //decrement current recursion depth
 
 	delete cc;
 	hit_count++;
@@ -2453,11 +2430,18 @@ ASObject* SyntheticFunction::callImpl(ASObject* obj, ASObject* const* args, uint
  * This executes a C++ function.
  * It consumes one reference of obj and one of each arg
  */
-ASObject* Function::callImpl(ASObject* obj, ASObject* const* args, uint32_t num_args, bool thisOverride)
+ASObject* Function::call(ASObject* obj, ASObject* const* args, uint32_t num_args)
 {
+	/*
+	 * We do not enforce ABCVm::limits.max_recursion here.
+	 * This should be okey, because there is no infinite recursion
+	 * using only builtin functions.
+	 * Additionally, we still need to run builtin code (such as the ASError constructor) when
+	 * ABCVm::limits.max_recursion is reached in SyntheticFunction::call.
+	 */
 	ASObject* ret;
-	if(isBound() && !thisOverride)
-	{
+	if(isBound())
+	{ /* closure_this can never been overriden */
 		LOG(LOG_CALLS,_("Calling with closure ") << this);
 		if(obj)
 			obj->decRef();
@@ -3047,36 +3031,6 @@ ASObject* Class_base::coerce(ASObject* o) const
 	if(!o->getClass() || !o->getClass()->isSubClass(this))
 		throw Class<TypeError>::getInstanceS("Wrong type");
 	return o;
-}
-
-IFunction* Class_base::getBorrowedMethod(const multiname& name)
-{
-	variable* ret=Variables.findObjVar(name,NO_CREATE_TRAIT,BORROWED_TRAIT);
-	if(ret && ret->var && ret->var->is<IFunction>())
-		return ret->var->as<IFunction>();
-	if(super)
-		return super->getBorrowedMethod(name);
-	return NULL;
-}
-
-IFunction* Class_base::getBorrowedSetter(const multiname& name)
-{
-	variable* ret=Variables.findObjVar(name,NO_CREATE_TRAIT,BORROWED_TRAIT);
-	if(ret && ret->setter)
-		return ret->setter;
-	if(super)
-		return super->getBorrowedSetter(name);
-	return NULL;
-}
-
-IFunction* Class_base::getBorrowedGetter(const multiname& name)
-{
-	variable* ret=Variables.findObjVar(name,NO_CREATE_TRAIT,BORROWED_TRAIT);
-	if(ret && ret->getter)
-		return ret->getter;
-	if(super)
-		return super->getBorrowedGetter(name);
-	return NULL;
 }
 
 ASFUNCTIONBODY(Class_base,_toString)
@@ -3886,6 +3840,8 @@ ASObject* ASNop(ASObject* obj, ASObject* const* args, const unsigned int argslen
 	return new Undefined;
 }
 
+Class<IFunction>* Class<IFunction>::this_class = NULL;
+
 ASObject* Class<IFunction>::getInstance(bool construct, ASObject* const* args, const unsigned int argslen)
 {
 	if(argslen)
@@ -3895,9 +3851,8 @@ ASObject* Class<IFunction>::getInstance(bool construct, ASObject* const* args, c
 
 Class<IFunction>* Class<IFunction>::getClass()
 {
-	std::map<QName, Class_base*>::iterator it=sys->classes.find(QName(ClassName<IFunction>::name,ClassName<IFunction>::ns));
 	Class<IFunction>* ret=NULL;
-	if(it==sys->classes.end()) //This class is not yet in the map, create it
+	if(!this_class) //This class is not yet in the map, create it
 	{
 		ret=new Class<IFunction>;
 		ret->prototype = _MNR(new_asobject());
@@ -3905,6 +3860,7 @@ Class<IFunction>* Class<IFunction>::getClass()
 		ret->max_level=ret->super->max_level+1;
 		ret->prototype->setprop_prototype(ret->super->prototype);
 
+		this_class = ret;
 		sys->classes.insert(std::make_pair(QName(ClassName<IFunction>::name,ClassName<IFunction>::ns),ret));
 
 		//we cannot use sinit, as we need to set max_level before calling 'classes.insert' before calling
@@ -3920,7 +3876,7 @@ Class<IFunction>* Class<IFunction>::getClass()
 		ret->setDeclaredMethodByQName("toString",AS3,Class<IFunction>::getFunction(Class_base::_toString),NORMAL_METHOD,false);
 	}
 	else
-		ret=static_cast<Class<IFunction>*>(it->second);
+		ret=this_class;
 
 	ret->incRef();
 	return ret;

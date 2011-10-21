@@ -1304,25 +1304,9 @@ void ABCVm::setSuper(call_context* th, int n)
 	assert_and_throw(th->inClass->super);
 	assert_and_throw(obj->getClass());
 	assert_and_throw(obj->getClass()->isSubClass(th->inClass));
-	IFunction* o = th->inClass->super->getBorrowedSetter(*name);
-	if(o)
-		_MR( o->call(obj,&value,1) );
-	else
-	{
-		//Look for instance variables. We look at obj, because all
-		//the instance variables from super are also there
-		//We should look only for DECLARED_TRAITS, but it isn't wrong this way either
-		variable* v = obj->findSettable(*name,false);
-		if(!v)
-		{
-			LOG(LOG_NOT_IMPLEMENTED,"setSuper: did not find setter " << *name);
-			obj->decRef();
-			value->decRef();
-			return;
-		}
-		assert(v->var); /* instance variables can only by var */
-		v->setVar(value);
-	}
+
+	obj->setVariableByMultiname(*name,value,th->inClass->super);
+	obj->decRef();
 }
 
 void ABCVm::getSuper(call_context* th, int n)
@@ -1336,27 +1320,21 @@ void ABCVm::getSuper(call_context* th, int n)
 	assert_and_throw(th->inClass->super);
 	assert_and_throw(obj->getClass());
 	assert_and_throw(obj->getClass()->isSubClass(th->inClass));
-	IFunction* o = th->inClass->super->getBorrowedGetter(*name);
-	ASObject* ret;
-	if(o)
-		ret = o->call(obj,NULL,0);
+
+	ASObject* ret = obj->getVariableByMultiname(*name,ASObject::NONE,th->inClass->super);
+	if(!ret)
+	{
+		LOG(LOG_NOT_IMPLEMENTED,"getSuper: Did not find " << *name);
+		ret = new Undefined;
+	}
 	else
 	{
-		//Look for instance variables. We look at obj, because all
-		//the instance variables from super are also there
-		//We should look only for DECLARED_TRAITS, but it isn't wrong this way either
-		variable* v = obj->findGettable(*name,false);
-		if(!v)
-		{
-			LOG(LOG_NOT_IMPLEMENTED,"getSuper: did not find getter " << *name);
-			obj->decRef();
-			th->runtime_stack_push(new Undefined);
-			return;
-		}
-		assert(v->var); /* instance variables can only by var */
-		ret = v->var;
+		if(ret->is<Definable>())
+			ret = ret->as<Definable>()->define();
 		ret->incRef();
 	}
+
+	obj->decRef();
 	th->runtime_stack_push(ret);
 }
 
@@ -1566,19 +1544,12 @@ void ABCVm::callSuper(call_context* th, int n, int m, method_info** called_mi, b
 	assert_and_throw(th->inClass->super);
 	assert_and_throw(obj->getClass());
 	assert_and_throw(obj->getClass()->isSubClass(th->inClass));
-	IFunction* o = th->inClass->super->getBorrowedMethod(*name);
-
-	if(o)
-	{
-		ASObject* ret = o->call(obj, args, m);
-		if(keepReturn)
-			th->runtime_stack_push(ret);
-		else
-			ret->decRef();
-	}
+	ASObject* f = obj->getVariableByMultiname(*name,ASObject::NONE,th->inClass->super);
+	if(f)
+		callImpl(th, f, obj, args, m, called_mi, keepReturn);
 	else
 	{
-		LOG(LOG_NOT_IMPLEMENTED,_("Calling an undefined function ") << name->name_s);
+		LOG(LOG_ERROR,_("Calling an undefined function ") << name->name_s);
 		if(keepReturn)
 			th->runtime_stack_push(new Undefined);
 	}
@@ -1670,7 +1641,20 @@ ASObject* ABCVm::asTypelate(ASObject* type, ASObject* obj)
 {
 	LOG(LOG_CALLS,_("asTypelate"));
 
-	assert_and_throw(type->getObjectType()==T_CLASS);
+	//HACK: until we have implemented all flash classes
+	if(type->is<Undefined>())
+	{
+		LOG(LOG_NOT_IMPLEMENTED,"asTypelate with undefined");
+		type->decRef();
+		return obj;
+	}
+
+	if(!type->is<Class_base>())
+	{
+		obj->decRef();
+		type->decRef();
+		throw Class<TypeError>::getInstanceS("Error #1009: Not a type in asTypelate");
+	}
 	Class_base* c=static_cast<Class_base*>(type);
 	//Special case numeric types
 	if(obj->getObjectType()==T_INTEGER || obj->getObjectType()==T_UINTEGER || obj->getObjectType()==T_NUMBER)
@@ -1789,7 +1773,12 @@ void ABCVm::constructProp(call_context* th, int n, int m)
 
 
 	if(o==NULL)
-		throw RunTimeException("Could not resolve property in constructProp");
+	{
+		for(int i=0;i<m;++i)
+			args[i]->decRef();
+		obj->decRef();
+		throw Class<ReferenceError>::getInstanceS("Error #1065: Variable is not defined.");
+	}
 
 	//The get protocol expects that we incRef the var
 	o->incRef();
